@@ -2,6 +2,7 @@ package io.github.wowmancode.spartaremixer.media
 
 import android.content.Context
 import io.github.wowmancode.spartaremixer.core.Clip
+import io.github.wowmancode.spartaremixer.core.Layer
 import io.github.wowmancode.spartaremixer.core.Project
 import io.github.wowmancode.spartaremixer.core.Source
 import org.json.JSONArray
@@ -28,13 +29,22 @@ object ProjectStore {
                 JSONObject()
                     .put("id", it.id).put("sourceId", it.sourceId).put("track", it.track)
                     .put("startUs", it.startUs).put("inUs", it.inUs).put("outUs", it.outUs)
-                    .put("semitones", it.semitones).put("invert", it.invert),
+                    .put("semitones", it.semitones).put("invert", it.invert)
+                    .put("keepLength", it.keepLength),
+            )
+        }
+        val layers = JSONArray()
+        project.layers.forEach {
+            layers.put(
+                JSONObject()
+                    .put("scale", it.scale.toDouble()).put("x", it.x.toDouble()).put("y", it.y.toDouble())
+                    .put("flipH", it.flipH).put("flipV", it.flipV).put("volume", it.volume.toDouble()),
             )
         }
         val root = JSONObject()
             .put("bpm", project.bpm).put("snapEnabled", project.snapEnabled)
             .put("snapBeats", project.snapBeats).put("nextId", project.nextId)
-            .put("sources", sources).put("clips", clips)
+            .put("sources", sources).put("clips", clips).put("layers", layers)
         val target = file(context)
         val temp = File(target.parentFile, "project.tmp")
         temp.writeText(root.toString())
@@ -65,8 +75,18 @@ object ProjectStore {
                     clips += Clip(
                         o.getLong("id"), o.getString("sourceId"), o.getInt("track"),
                         o.getLong("startUs"), o.getLong("inUs"), o.getLong("outUs"),
-                        o.getInt("semitones"), o.getBoolean("invert"),
+                        o.getInt("semitones"), o.getBoolean("invert"), o.optBoolean("keepLength", false),
                     )
+                }
+                root.optJSONArray("layers")?.let { l ->
+                    layers.clear()
+                    for (i in 0 until l.length()) {
+                        val o = l.getJSONObject(i)
+                        layers += Layer(
+                            o.getDouble("scale").toFloat(), o.getDouble("x").toFloat(), o.getDouble("y").toFloat(),
+                            o.getBoolean("flipH"), o.getBoolean("flipV"), o.getDouble("volume").toFloat(),
+                        )
+                    }
                 }
             }
         } catch (_: org.json.JSONException) {

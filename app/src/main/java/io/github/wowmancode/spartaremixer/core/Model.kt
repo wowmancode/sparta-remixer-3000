@@ -1,12 +1,14 @@
 package io.github.wowmancode.spartaremixer.core
 
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToLong
 
-const val TRACK_COUNT = 3
+const val MAX_LAYERS = 6
+const val DEFAULT_LAYERS = 3
 const val MIN_CLIP_US = 20_000L
 
 /** An imported media file. displayWidth/Height already account for rotation; 0 means audio only. */
@@ -22,8 +24,9 @@ data class Source(
 }
 
 /**
- * A piece of a source placed on the timeline. Pitch is varispeed, like a sampler:
- * raising it plays audio and video faster, so inUs/outUs stay in source time.
+ * A piece of a source placed on the timeline; [track] is its layer index (0 is the front).
+ * By default pitch is varispeed, like a sampler: raising it plays audio and video faster.
+ * With [keepLength] the audio is pitch-shifted and the clip stays at normal speed.
  */
 data class Clip(
     val id: Long,
@@ -34,8 +37,12 @@ data class Clip(
     val outUs: Long,
     val semitones: Int = 0,
     val invert: Boolean = false,
+    val keepLength: Boolean = false,
 ) {
-    val speed: Double get() = 2.0.pow(semitones / 12.0)
+    val pitchRatio: Double get() = 2.0.pow(semitones / 12.0)
+
+    /** How fast the source plays on the timeline. */
+    val speed: Double get() = if (keepLength) 1.0 else pitchRatio
     val durationUs: Long get() = ((outUs - inUs) / speed).roundToLong()
     val endUs: Long get() = startUs + durationUs
 
@@ -52,33 +59,70 @@ data class Clip(
     }
 }
 
-data class VideoSegment(val startUs: Long, val endUs: Long, val clip: Clip?)
+/** Per-layer look and level. x and y move the center by fractions of the half frame; +y is down. */
+data class Layer(
+    val scale: Float = 1f,
+    val x: Float = 0f,
+    val y: Float = 0f,
+    val flipH: Boolean = false,
+    val flipV: Boolean = false,
+    val volume: Float = 1f,
+)
+
+/** A quad in clip space; negative scales mirror the image. */
+data class Placement(val scaleX: Float, val scaleY: Float, val centerX: Float, val centerY: Float)
+
+object Composition {
+    /** Fits the source inside the output, then applies the layer's scale, position and flips. */
+    fun place(sourceWidth: Int, sourceHeight: Int, outWidth: Int, outHeight: Int, layer: Layer): Placement {
+        val sourceAspect = sourceWidth.toFloat() / sourceHeight
+        val outAspect = outWidth.toFloat() / outHeight
+        val fitX = if (sourceAspect > outAspect) 1f else sourceAspect / outAspect
+        val fitY = if (sourceAspect > outAspect) outAspect / sourceAspect else 1f
+        return Placement(
+            fitX * layer.scale * (if (layer.flipH) -1f else 1f),
+            fitY * layer.scale * (if (layer.flipV) -1f else 1f),
+            layer.x,
+            -layer.y,
+        )
+    }
+
+    /** 16:9 frame, portrait when the earliest video clip is portrait. */
+    fun outputSize(shortSide: Int, clips: List<Clip>, source: (String) -> Source?): Pair<Int, Int> {
+        val first = clips.sortedBy { it.startUs }.firstNotNullOfOrNull { c -> source(c.sourceId)?.takeIf { it.hasVideo } }
+        val short = shortSide and 1.inv()
+        val long = (shortSide * 16.0 / 9.0).roundToLong().toInt() and 1.inv()
+        return if (first != null && first.displayHeight > first.displayWidth) short to long else long to short
+    }
+}
+
+/** Grid sizes in beats, shared by snapping and slicing. */
+object Divisions {
+    val all: List<Pair<Double, String>> = listOf(
+        4.0 to "1 bar",
+        2.0 to "2 beats",
+        1.0 to "1 beat",
+        0.5 to "1/2 beat",
+        0.25 to "1/4 beat",
+        1.0 / 6.0 to "1/6 beat",
+        0.125 to "1/8 beat",
+    )
+
+    fun name(beats: Double): String = all.firstOrNull { abs(it.first - beats) < 1e-9 }?.second ?: "1 beat"
+}
 
 object Timeline {
     fun durationUs(clips: List<Clip>): Long = clips.maxOfOrNull { it.endUs } ?: 0L
 
-    /** The clip visible at a time: the top track wins, then the most recently started clip. */
-    fun visibleClip(clips: List<Clip>, timeUs: Long, hasVideo: (Clip) -> Boolean): Clip? =
-        clips.filter { it.contains(timeUs) && hasVideo(it) }
-            .minWithOrNull(compareBy<Clip> { it.track }.thenByDescending { it.startUs })
-
-    /** Flattens the tracks into a gapless list of what is on screen; clip == null is black. */
-    fun videoSegments(clips: List<Clip>, hasVideo: (Clip) -> Boolean): List<VideoSegment> {
-        val total = durationUs(clips)
-        if (total <= 0) return emptyList()
-        val cuts = sortedSetOf(0L, total)
-        clips.forEach { cuts += it.startUs; cuts += it.endUs }
-        val result = ArrayList<VideoSegment>()
-        cuts.toList().zipWithNext().forEach { (a, b) ->
-            val clip = visibleClip(clips, a, hasVideo)
-            val last = result.lastOrNull()
-            if (last != null && last.clip?.id == clip?.id) {
-                result[result.lastIndex] = last.copy(endUs = b)
-            } else {
-                result += VideoSegment(a, b, clip)
-            }
+    /** The clips on screen at a time, back to front; within a layer the latest start wins. */
+    fun stack(clips: List<Clip>, timeUs: Long, layerCount: Int, hasVideo: (Clip) -> Boolean): List<Clip> {
+        val winners = arrayOfNulls<Clip>(layerCount)
+        for (clip in clips) {
+            if (clip.track !in 0 until layerCount || !clip.contains(timeUs) || !hasVideo(clip)) continue
+            val current = winners[clip.track]
+            if (current == null || clip.startUs > current.startUs) winners[clip.track] = clip
         }
-        return result
+        return winners.reversed().filterNotNull()
     }
 
     fun beatUs(bpm: Double): Double = 60_000_000.0 / bpm

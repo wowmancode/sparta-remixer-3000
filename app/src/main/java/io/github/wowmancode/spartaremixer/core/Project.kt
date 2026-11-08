@@ -4,6 +4,7 @@ package io.github.wowmancode.spartaremixer.core
 class Project {
     val sources = ArrayList<Source>()
     val clips = ArrayList<Clip>()
+    val layers = ArrayList<Layer>().apply { repeat(DEFAULT_LAYERS) { add(Layer()) } }
     var bpm = 120.0
     var snapEnabled = true
     var snapBeats = 1.0
@@ -18,6 +19,35 @@ class Project {
     fun replace(clip: Clip) {
         val i = clips.indexOfFirst { it.id == clip.id }
         if (i >= 0) clips[i] = clip
+    }
+
+    fun addLayer(): Boolean {
+        if (layers.size >= MAX_LAYERS) return false
+        layers += Layer()
+        return true
+    }
+
+    /** Removes a layer and its clips. The last remaining layer cannot be removed. */
+    fun removeLayer(index: Int): Boolean {
+        if (layers.size <= 1 || index !in layers.indices) return false
+        layers.removeAt(index)
+        val kept = clips.filter { it.track != index }.map { if (it.track > index) it.copy(track = it.track - 1) else it }
+        clips.clear()
+        clips.addAll(kept)
+        return true
+    }
+
+    /** Changes a layer's number; its clips travel with it. */
+    fun moveLayer(from: Int, to: Int) {
+        if (from !in layers.indices || to !in layers.indices || from == to) return
+        val order = layers.indices.toMutableList()
+        order.add(to, order.removeAt(from))
+        val reordered = order.map { layers[it] }
+        layers.clear()
+        layers.addAll(reordered)
+        val moved = clips.map { it.copy(track = order.indexOf(it.track)) }
+        clips.clear()
+        clips.addAll(moved)
     }
 
     fun snapped(timeUs: Long): Long =

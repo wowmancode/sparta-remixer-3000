@@ -36,14 +36,89 @@ class CoreTest {
         assertNotNull(clip().splitAt(1_000_000, 2))
     }
 
-    @Test fun topTrackWinsAndGapsAreBlack() {
-        val low = clip(id = 1, track = 1, start = 0, out = 3_000_000)
-        val top = clip(id = 2, track = 0, start = 1_000_000, out = 1_000_000)
-        val late = clip(id = 3, track = 0, start = 4_000_000, out = 1_000_000)
-        val seg = Timeline.videoSegments(listOf(low, top, late)) { true }
-        assertEquals(listOf(1L, 2L, 1L, null, 3L), seg.map { it.clip?.id })
-        assertEquals(5_000_000L, seg.last().endUs)
-        for ((a, b) in seg.zipWithNext()) assertEquals(a.endUs, b.startUs)
+    @Test fun stackIsBackToFrontWithOneClipPerLayer() {
+        val back = clip(id = 1, track = 2, out = 3_000_000)
+        val front = clip(id = 2, track = 0, out = 3_000_000)
+        val earlier = clip(id = 3, track = 1, start = 0, out = 3_000_000)
+        val later = clip(id = 4, track = 1, start = 500_000, out = 3_000_000)
+        val all = listOf(front, later, earlier, back)
+        assertEquals(listOf(1L, 4L, 2L), Timeline.stack(all, 1_000_000, 3) { true }.map { it.id })
+        assertEquals(listOf(1L, 3L, 2L), Timeline.stack(all, 100_000, 3) { true }.map { it.id })
+        assertTrue(Timeline.stack(all, 9_000_000, 3) { true }.isEmpty())
+    }
+
+    @Test fun placementFitsThenAppliesLayer() {
+        val fit = Composition.place(320, 240, 640, 360, Layer())
+        assertEquals(0.75f, fit.scaleX, 0.001f)
+        assertEquals(1f, fit.scaleY, 0.001f)
+        val moved = Composition.place(640, 360, 640, 360, Layer(scale = 0.5f, x = 0.25f, y = 0.5f, flipH = true, flipV = true))
+        assertEquals(-0.5f, moved.scaleX, 0.001f)
+        assertEquals(-0.5f, moved.scaleY, 0.001f)
+        assertEquals(0.25f, moved.centerX, 0.001f)
+        assertEquals(-0.5f, moved.centerY, 0.001f)
+    }
+
+    @Test fun renumberingALayerKeepsItsClips() {
+        val p = Project()
+        p.clips += clip(id = 1, track = 0)
+        p.clips += clip(id = 2, track = 2)
+        p.layers[0] = Layer(scale = 0.5f)
+        p.moveLayer(0, 2)
+        assertEquals(0.5f, p.layers[2].scale, 0f)
+        assertEquals(2, p.clip(1)!!.track)
+        assertEquals(1, p.clip(2)!!.track)
+    }
+
+    @Test fun removingALayerShiftsLaterOnes() {
+        val p = Project()
+        p.clips += clip(id = 1, track = 0)
+        p.clips += clip(id = 2, track = 1)
+        p.clips += clip(id = 3, track = 2)
+        assertTrue(p.removeLayer(1))
+        assertEquals(listOf(0, 1), p.clips.map { it.track })
+        assertEquals(listOf(1L, 3L), p.clips.map { it.id })
+    }
+
+    @Test fun layerVolumeScalesTheMix() {
+        val c = clip(track = 1, out = 1_000_000)
+        val out = FloatArray(800)
+        AudioMix.mix(listOf(c), { Constant(1_000_000, 0.4f) }, 1000, out, 400, floatArrayOf(1f, 0.5f))
+        assertEquals(0.2f, out[100], 0.0001f)
+    }
+
+    private class Sine(val hz: Double) : PcmReader {
+        override val frames = 200_000L
+        override fun sample(frame: Long, channel: Int) =
+            (0.5 * kotlin.math.sin(2 * Math.PI * hz * frame / SAMPLE_RATE)).toFloat()
+    }
+
+    @Test fun keepLengthRaisesPitchWithoutChangingDuration() {
+        val c = clip(out = 2_000_000, semi = 12).copy(keepLength = true)
+        assertEquals(2_000_000L, c.durationUs)
+        val frames = SAMPLE_RATE
+        val out = FloatArray(frames * 2)
+        AudioMix.mix(listOf(c), { Sine(441.0) }, 20_000, out, frames)
+        var crossings = 0
+        for (i in 1 until frames) if (out[(i - 1) * 2] < 0f && out[i * 2] >= 0f) crossings++
+        assertTrue("crossings=$crossings", crossings in 860..904)
+        var peak = 0f
+        for (i in 0 until frames) peak = maxOf(peak, out[i * 2])
+        assertTrue("peak=$peak", peak in 0.4f..0.6f)
+    }
+
+    @Test fun keepLengthGrainsStayInsideTheClip() {
+        val c = clip(inUs = 500_000, out = 1_000_000, semi = 7).copy(keepLength = true)
+        val grains = PitchShift.grains(c, Sine(200.0))
+        val from = usToFrames(500_000)
+        assertTrue(grains.all { it >= from })
+        assertTrue(grains.all { it + kotlin.math.ceil(c.pitchRatio * PitchShift.GRAIN).toLong() <= usToFrames(1_000_000) })
+    }
+
+    @Test fun divisionsIncludeSixthsAndEighths() {
+        assertEquals("1/6 beat", Divisions.name(1.0 / 6.0))
+        assertEquals("1/8 beat", Divisions.name(0.125))
+        assertEquals(62_500L, Timeline.snap(70_000, 120.0, 0.125))
+        assertEquals(83_333L, Timeline.snap(80_000, 120.0, 1.0 / 6.0))
     }
 
     @Test fun snapRoundsToGrid() {

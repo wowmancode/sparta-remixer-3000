@@ -9,12 +9,13 @@ import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.view.Surface
+import io.github.wowmancode.spartaremixer.core.Placement
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 
-/** An EGL context drawing into the encoder's input surface. */
-class EglTarget(surface: Surface) {
+/** An EGL context drawing into an encoder surface, or off screen when [surface] is null. */
+class EglTarget(surface: Surface?, pbufferWidth: Int = 0, pbufferHeight: Int = 0) {
     private val display: EGLDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
     private val context: EGLContext
     private val eglSurface: EGLSurface
@@ -29,7 +30,8 @@ class EglTarget(surface: Surface) {
             EGL14.EGL_GREEN_SIZE, 8,
             EGL14.EGL_BLUE_SIZE, 8,
             EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-            EGL_RECORDABLE_ANDROID, 1,
+            if (surface != null) EGL_RECORDABLE_ANDROID else EGL14.EGL_SURFACE_TYPE,
+            if (surface != null) 1 else EGL14.EGL_PBUFFER_BIT,
             EGL14.EGL_NONE,
         )
         check(EGL14.eglChooseConfig(display, attributes, 0, configs, 0, 1, count, 0) && count[0] > 0) {
@@ -40,7 +42,12 @@ class EglTarget(surface: Surface) {
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0,
         )
         check(context != EGL14.EGL_NO_CONTEXT) { "eglCreateContext failed" }
-        eglSurface = EGL14.eglCreateWindowSurface(display, configs[0], surface, intArrayOf(EGL14.EGL_NONE), 0)
+        eglSurface = if (surface != null) {
+            EGL14.eglCreateWindowSurface(display, configs[0], surface, intArrayOf(EGL14.EGL_NONE), 0)
+        } else {
+            val size = intArrayOf(EGL14.EGL_WIDTH, pbufferWidth, EGL14.EGL_HEIGHT, pbufferHeight, EGL14.EGL_NONE)
+            EGL14.eglCreatePbufferSurface(display, configs[0], size, 0)
+        }
         check(eglSurface != EGL14.EGL_NO_SURFACE) { "eglCreateWindowSurface failed" }
         check(EGL14.eglMakeCurrent(display, eglSurface, eglSurface, context)) { "eglMakeCurrent failed" }
     }
@@ -54,7 +61,7 @@ class EglTarget(surface: Surface) {
         EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
         EGL14.eglDestroySurface(display, eglSurface)
         EGL14.eglDestroyContext(display, context)
-        EGL14.eglTerminate(display)
+        // No eglTerminate: the display is shared with any other thread using EGL.
     }
 
     private companion object {
@@ -62,7 +69,7 @@ class EglTarget(surface: Surface) {
     }
 }
 
-/** Draws a decoded external texture letterboxed, optionally with inverted colors. */
+/** Draws decoded external textures as placed quads, optionally with inverted colors. */
 class FrameRenderer(private val width: Int, private val height: Int) {
     private val program: Int
     private val positionHandle: Int
@@ -70,6 +77,7 @@ class FrameRenderer(private val width: Int, private val height: Int) {
     private val texMatrixHandle: Int
     private val scaleHandle: Int
     private val invertHandle: Int
+    private val centerHandle: Int
     private val quad: FloatBuffer = ByteBuffer.allocateDirect(4 * 4 * 4)
         .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
             put(
@@ -90,6 +98,7 @@ class FrameRenderer(private val width: Int, private val height: Int) {
         texMatrixHandle = GLES20.glGetUniformLocation(program, "uTexMatrix")
         scaleHandle = GLES20.glGetUniformLocation(program, "uScale")
         invertHandle = GLES20.glGetUniformLocation(program, "uInvert")
+        centerHandle = GLES20.glGetUniformLocation(program, "uCenter")
     }
 
     fun createTexture(): Int {
@@ -113,12 +122,7 @@ class FrameRenderer(private val width: Int, private val height: Int) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
     }
 
-    fun draw(texture: Int, texMatrix: FloatArray, sourceWidth: Int, sourceHeight: Int, invert: Boolean) {
-        drawBlack()
-        val sourceAspect = sourceWidth.toFloat() / sourceHeight
-        val targetAspect = width.toFloat() / height
-        val scaleX = if (sourceAspect > targetAspect) 1f else sourceAspect / targetAspect
-        val scaleY = if (sourceAspect > targetAspect) targetAspect / sourceAspect else 1f
+    fun draw(texture: Int, texMatrix: FloatArray, placement: Placement, invert: Boolean) {
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texture)
@@ -129,7 +133,8 @@ class FrameRenderer(private val width: Int, private val height: Int) {
         GLES20.glVertexAttribPointer(texCoordHandle, 2, GLES20.GL_FLOAT, false, 16, quad)
         GLES20.glEnableVertexAttribArray(texCoordHandle)
         GLES20.glUniformMatrix4fv(texMatrixHandle, 1, false, texMatrix, 0)
-        GLES20.glUniform2f(scaleHandle, scaleX, scaleY)
+        GLES20.glUniform2f(scaleHandle, placement.scaleX, placement.scaleY)
+        GLES20.glUniform2f(centerHandle, placement.centerX, placement.centerY)
         GLES20.glUniform1f(invertHandle, if (invert) 1f else 0f)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
@@ -167,9 +172,10 @@ class FrameRenderer(private val width: Int, private val height: Int) {
             attribute vec2 aTexCoord;
             uniform mat4 uTexMatrix;
             uniform vec2 uScale;
+            uniform vec2 uCenter;
             varying vec2 vTexCoord;
             void main() {
-                gl_Position = vec4(aPosition * uScale, 0.0, 1.0);
+                gl_Position = vec4(aPosition * uScale + uCenter, 0.0, 1.0);
                 vTexCoord = (uTexMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
             }
         """

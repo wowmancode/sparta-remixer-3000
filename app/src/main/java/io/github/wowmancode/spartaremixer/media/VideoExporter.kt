@@ -1,31 +1,27 @@
 package io.github.wowmancode.spartaremixer.media
 
 import android.content.Context
-import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
-import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMuxer
-import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
 import io.github.wowmancode.spartaremixer.core.AudioMix
 import io.github.wowmancode.spartaremixer.core.Clip
+import io.github.wowmancode.spartaremixer.core.Composition
+import io.github.wowmancode.spartaremixer.core.Layer
 import io.github.wowmancode.spartaremixer.core.PcmReader
 import io.github.wowmancode.spartaremixer.core.SAMPLE_RATE
 import io.github.wowmancode.spartaremixer.core.Source
 import io.github.wowmancode.spartaremixer.core.Timeline
-import io.github.wowmancode.spartaremixer.core.VideoSegment
 import io.github.wowmancode.spartaremixer.core.usToFrames
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
 import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
@@ -39,6 +35,7 @@ data class ExportSettings(val shortSide: Int = 720, val fps: Int = 30)
 class VideoExporter(
     private val context: Context,
     private val clips: List<Clip>,
+    private val layers: List<Layer>,
     private val sources: Map<String, Source>,
     private val readers: Map<String, PcmReader>,
     private val settings: ExportSettings,
@@ -94,6 +91,7 @@ class VideoExporter(
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
         val totalFrames = usToFrames(totalUs)
         val mixChunk = FloatArray(8192 * 2)
+        val gains = FloatArray(layers.size) { layers[it].volume }
         try {
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             codec.start()
@@ -114,7 +112,7 @@ class VideoExporter(
                             codec.queueInputBuffer(index, 0, 0, timeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
                             inputDone = true
                         } else {
-                            AudioMix.mix(clips, { readers[it] }, frame, mixChunk, frames)
+                            AudioMix.mix(clips, { readers[it] }, frame, mixChunk, frames, gains)
                             for (i in 0 until frames * 2) {
                                 input.putShort((mixChunk[i].coerceIn(-1f, 1f) * 32767f).roundToInt().toShort())
                             }
@@ -152,24 +150,15 @@ class VideoExporter(
         checkNotNull(audioFormat) { "The audio encoder produced no format" }
     }
 
-    private fun outputSize(): Pair<Int, Int> {
-        val first = clips.sortedBy { it.startUs }.firstNotNullOfOrNull { c -> sources[c.sourceId]?.takeIf { it.hasVideo } }
-        val portrait = first != null && first.displayHeight > first.displayWidth
-        val ratio = 16.0 / 9.0
-        val short = even(settings.shortSide)
-        val long = even((settings.shortSide * ratio).roundToInt())
-        return if (portrait) short to long else long to short
-    }
-
-    private fun even(v: Int) = v and 1.inv()
-
     private fun encodeVideo(totalUs: Long) {
-        val (width, height) = outputSize()
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, (width * height * settings.fps * 0.2).roundToInt())
-            setInteger(MediaFormat.KEY_FRAME_RATE, settings.fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        val (width, height) = Composition.outputSize(settings.shortSide, clips) { sources[it] }
+        val makeFormat = {
+            MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, (width * height * settings.fps * 0.2).roundToInt())
+                setInteger(MediaFormat.KEY_FRAME_RATE, settings.fps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            }
         }
         val encoderName = MediaCodecList(MediaCodecList.REGULAR_CODECS).findEncoderForFormat(
             MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height),
@@ -180,17 +169,36 @@ class VideoExporter(
         var renderer: FrameRenderer? = null
         val callbackThread = HandlerThread("frame-available").apply { start() }
         try {
-            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            Codecs.configureFast(encoder, makeFormat, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             inputSurface = encoder.createInputSurface()
             egl = EglTarget(inputSurface)
             renderer = FrameRenderer(width, height)
             encoder.start()
             val totalTicks = max(1L, Timeline.tickAtOrAfter(totalUs, settings.fps))
-            val handler = Handler(callbackThread.looper)
-            val hasVideo = { c: Clip -> sources[c.sourceId]?.hasVideo == true }
-            val pipeline = Pipeline(encoder, egl, renderer, handler, totalTicks)
-            for (segment in Timeline.videoSegments(clips, hasVideo)) {
-                pipeline.render(segment)
+            val pool = DecoderPool(context, renderer, Handler(callbackThread.looper))
+            try {
+                val hasVideo = { c: Clip -> sources[c.sourceId]?.hasVideo == true }
+                for (tick in 0 until totalTicks) {
+                    checkCancelled()
+                    val timeUs = tick * 1_000_000L / settings.fps
+                    renderer.drawBlack()
+                    for (clip in Timeline.stack(clips, timeUs, layers.size, hasVideo)) {
+                        val source = sources.getValue(clip.sourceId)
+                        val decoder = pool.get(clip.track, source, tick)
+                        decoder.advanceTo(clip.sourceAt(timeUs).coerceIn(clip.inUs, clip.outUs))
+                        if (decoder.hasFrame) {
+                            val placement = Composition.place(
+                                source.displayWidth, source.displayHeight, width, height, layers[clip.track],
+                            )
+                            renderer.draw(decoder.texture, decoder.matrix, placement, clip.invert)
+                        }
+                    }
+                    egl.present(tick * 1_000_000_000L / settings.fps)
+                    drainEncoder(encoder, false)
+                    onProgress(0.2f + 0.8f * (tick + 1) / totalTicks)
+                }
+            } finally {
+                pool.release()
             }
             encoder.signalEndOfInputStream()
             drainEncoder(encoder, true)
@@ -201,145 +209,6 @@ class VideoExporter(
             inputSurface?.release()
             encoder.release()
             callbackThread.quitSafely()
-        }
-    }
-
-    private inner class Pipeline(
-        val encoder: MediaCodec,
-        val egl: EglTarget,
-        val renderer: FrameRenderer,
-        val handler: Handler,
-        val totalTicks: Long,
-    ) {
-        val fps = settings.fps
-
-        fun tickUs(tick: Long): Long = tick * 1_000_000L / fps
-
-        fun emit(tick: Long) {
-            egl.present(tick * 1_000_000_000L / fps)
-            drainEncoder(encoder, false)
-            onProgress(0.2f + 0.8f * (tick + 1) / totalTicks)
-        }
-
-        fun render(segment: VideoSegment) {
-            val first = Timeline.tickAtOrAfter(segment.startUs, fps)
-            val end = Timeline.tickAtOrAfter(segment.endUs, fps)
-            if (first >= end) return
-            val clip = segment.clip
-            if (clip == null) {
-                for (t in first until end) {
-                    checkCancelled()
-                    renderer.drawBlack()
-                    emit(t)
-                }
-            } else {
-                renderClip(clip, first, end)
-            }
-        }
-
-        private fun renderClip(clip: Clip, firstTick: Long, endTick: Long) {
-            val source = sources.getValue(clip.sourceId)
-            val extractor = MediaExtractor()
-            var decoder: MediaCodec? = null
-            var surface: Surface? = null
-            var surfaceTexture: SurfaceTexture? = null
-            val texture = renderer.createTexture()
-            val frames = Semaphore(0)
-            val matrix = FloatArray(16)
-            var haveFrame = false
-            var tick = firstTick
-
-            fun sourceTime(t: Long) = max(clip.inUs, clip.sourceAt(tickUs(t)))
-
-            fun drawCurrent() {
-                if (haveFrame) {
-                    renderer.draw(texture, matrix, source.displayWidth, source.displayHeight, clip.invert)
-                } else {
-                    renderer.drawBlack()
-                }
-            }
-
-            try {
-                extractor.setDataSource(context, Uri.parse(source.uri), null)
-                val track = (0 until extractor.trackCount).first {
-                    extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
-                }
-                extractor.selectTrack(track)
-                val format = extractor.getTrackFormat(track)
-                extractor.seekTo(sourceTime(firstTick), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-                val stopAfter = sourceTime(endTick - 1) + 1_000_000L
-
-                val st = SurfaceTexture(texture)
-                surfaceTexture = st
-                st.setOnFrameAvailableListener({ frames.release() }, handler)
-                val outSurface = Surface(st)
-                surface = outSurface
-                val codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
-                decoder = codec
-                codec.configure(format, outSurface, null, 0)
-                codec.start()
-
-                val decodeInfo = MediaCodec.BufferInfo()
-                var inputDone = false
-                var outputDone = false
-                var idleSince = System.currentTimeMillis()
-                while (tick < endTick && !outputDone) {
-                    checkCancelled()
-                    if (!inputDone) {
-                        val index = codec.dequeueInputBuffer(TIMEOUT_US)
-                        if (index >= 0) {
-                            val size = extractor.readSampleData(codec.getInputBuffer(index)!!, 0)
-                            if (size < 0 || extractor.sampleTime > stopAfter) {
-                                codec.queueInputBuffer(index, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                                inputDone = true
-                            } else {
-                                codec.queueInputBuffer(index, 0, size, extractor.sampleTime, 0)
-                                extractor.advance()
-                            }
-                        }
-                    }
-                    val index = codec.dequeueOutputBuffer(decodeInfo, TIMEOUT_US)
-                    if (index >= 0) {
-                        idleSince = System.currentTimeMillis()
-                        outputDone = decodeInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
-                        val pts = decodeInfo.presentationTimeUs
-                        val wanted = decodeInfo.size > 0 && pts >= sourceTime(tick)
-                        codec.releaseOutputBuffer(index, wanted)
-                        if (wanted) {
-                            if (frames.tryAcquire(FRAME_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                                st.updateTexImage()
-                                st.getTransformMatrix(matrix)
-                                haveFrame = true
-                            }
-                            while (tick < endTick && sourceTime(tick) <= pts) {
-                                drawCurrent()
-                                emit(tick)
-                                tick++
-                            }
-                        }
-                    } else if (System.currentTimeMillis() - idleSince > DECODER_STALL_MS) {
-                        throw IllegalStateException("The video decoder stopped responding on ${source.name}")
-                    }
-                }
-                // Past the end of the file: hold the last frame for any remaining ticks.
-                while (tick < endTick) {
-                    checkCancelled()
-                    drawCurrent()
-                    emit(tick)
-                    tick++
-                }
-            } finally {
-                try {
-                    decoder?.stop()
-                } catch (_: RuntimeException) {
-                    // Stopping can fail after a codec error; release below still frees it.
-                }
-                decoder?.release()
-                surface?.release()
-                surfaceTexture?.release()
-                renderer.deleteTexture(texture)
-                extractor.release()
-            }
         }
     }
 
@@ -396,7 +265,6 @@ class VideoExporter(
 
     private companion object {
         const val TIMEOUT_US = 5_000L
-        const val FRAME_TIMEOUT_MS = 2_500L
         const val DECODER_STALL_MS = 15_000L
     }
 }

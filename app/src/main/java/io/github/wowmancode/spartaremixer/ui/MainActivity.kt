@@ -3,8 +3,6 @@ package io.github.wowmancode.spartaremixer.ui
 import android.app.Activity
 import android.app.AlertDialog
 import android.content.Intent
-import android.graphics.ColorMatrix
-import android.graphics.ColorMatrixColorFilter
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -21,12 +19,16 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.HorizontalScrollView
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import io.github.wowmancode.spartaremixer.core.AutoCut
+import io.github.wowmancode.spartaremixer.core.Composition
+import io.github.wowmancode.spartaremixer.core.Divisions
+import io.github.wowmancode.spartaremixer.core.Layer
+import io.github.wowmancode.spartaremixer.core.MAX_LAYERS
 import io.github.wowmancode.spartaremixer.core.Clip
 import io.github.wowmancode.spartaremixer.core.ENVELOPE_WINDOW_US
 import io.github.wowmancode.spartaremixer.core.PcmReader
@@ -37,7 +39,7 @@ import io.github.wowmancode.spartaremixer.core.Timeline
 import io.github.wowmancode.spartaremixer.media.AudioPreview
 import io.github.wowmancode.spartaremixer.media.ExportCancelled
 import io.github.wowmancode.spartaremixer.media.ExportSettings
-import io.github.wowmancode.spartaremixer.media.FramePreviewer
+import io.github.wowmancode.spartaremixer.media.FrameProxy
 import io.github.wowmancode.spartaremixer.media.MediaLibrary
 import io.github.wowmancode.spartaremixer.media.ProjectStore
 import io.github.wowmancode.spartaremixer.media.VideoExporter
@@ -47,10 +49,13 @@ import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
 class MainActivity : Activity(), TimelineView.Listener {
-    private class Snapshot(val clips: List<Clip>, val bpm: Double, val selected: Long?)
+    private class Snapshot(val clips: List<Clip>, val layers: List<Layer>, val bpm: Double, val selected: Long?)
 
     private val main = Handler(Looper.getMainLooper())
     private val background = Executors.newSingleThreadExecutor()
+    private val proxyWorker = Executors.newSingleThreadExecutor()
+    private val proxies = HashMap<String, FrameProxy>()
+    @Volatile private var closing = false
     private var project = Project()
     private val readers = HashMap<String, PcmReader>()
     private val envelopes = HashMap<String, FloatArray>()
@@ -59,15 +64,16 @@ class MainActivity : Activity(), TimelineView.Listener {
     private val tapTempo = TapTempo()
 
     private var selectedId: Long? = null
+    private var activeLayer = 0
     private var playheadUs = 0L
     private var player: AudioPreview? = null
     private var pendingExport: ExportSettings? = null
     @Volatile private var exportCancelled = false
     private var busyCount = 0
 
-    private lateinit var previewer: FramePreviewer
     private lateinit var timeline: TimelineView
-    private lateinit var previewImage: ImageView
+    private lateinit var preview: PreviewSurface
+    private lateinit var proxyStatus: TextView
     private lateinit var hint: TextView
     private lateinit var playButton: Button
     private lateinit var undoButton: Button
@@ -78,30 +84,30 @@ class MainActivity : Activity(), TimelineView.Listener {
     private lateinit var timeLabel: TextView
     private lateinit var pitchLabel: TextView
     private lateinit var invertButton: Button
+    private lateinit var keepLengthButton: Button
+    private lateinit var layerPanel: View
+    private lateinit var layerLabel: TextView
+    private lateinit var flipHButton: Button
+    private lateinit var flipVButton: Button
+    private lateinit var scaleSlider: Slider
+    private lateinit var volumeSlider: Slider
+    private lateinit var xSlider: Slider
+    private lateinit var ySlider: Slider
     private lateinit var clipBar: View
     private lateinit var busyBar: ProgressBar
 
-    private val invertFilter = ColorMatrixColorFilter(
-        ColorMatrix(
-            floatArrayOf(
-                -1f, 0f, 0f, 0f, 255f,
-                0f, -1f, 0f, 0f, 255f,
-                0f, 0f, -1f, 0f, 255f,
-                0f, 0f, 0f, 1f, 0f,
-            ),
-        ),
-    )
+    private class Slider(val view: View, val set: (Float) -> Unit)
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).roundToInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        previewer = FramePreviewer(this) { previewImage.setImageBitmap(it) }
         setContentView(buildUi())
         ProjectStore.load(this)?.let { project = it }
         timeline.project = project
         timeline.envelopes = envelopes
         loadAllAudio()
+        project.sources.forEach { queueProxy(it) }
         refresh()
     }
 
@@ -175,15 +181,20 @@ class MainActivity : Activity(), TimelineView.Listener {
         )
 
         val previewFrame = android.widget.FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        previewImage = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        preview = PreviewSurface(this).apply { listener = previewGestures }
+        proxyStatus = label("").apply {
+            setBackgroundColor(Color.argb(150, 0, 0, 0))
+            visibility = View.GONE
+        }
         hint = TextView(this).apply {
             text = "Import a video to start.\nPinch the timeline to zoom, drag clips to move them."
             setTextColor(Color.rgb(190, 170, 170))
             gravity = Gravity.CENTER
             textSize = 14f
         }
-        previewFrame.addView(previewImage, android.widget.FrameLayout.LayoutParams(-1, -1))
+        previewFrame.addView(preview, android.widget.FrameLayout.LayoutParams(-1, -1))
         previewFrame.addView(hint, android.widget.FrameLayout.LayoutParams(-1, -1))
+        previewFrame.addView(proxyStatus, android.widget.FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START))
         busyBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
             visibility = View.INVISIBLE
@@ -218,7 +229,9 @@ class MainActivity : Activity(), TimelineView.Listener {
 
         pitchLabel = label("0 st")
         invertButton = button("Invert") { edit { it.copy(invert = !it.invert) } }
+        keepLengthButton = button("Keep length") { edit { it.copy(keepLength = !it.keepLength) } }
         clipBar = row(
+            button("Layer settings", accent = true) { showLayerPanel(true) },
             button("Split") { splitAtPlayhead() },
             button("Copy") { duplicateSelected() },
             button("Delete") { deleteSelected() },
@@ -230,14 +243,159 @@ class MainActivity : Activity(), TimelineView.Listener {
             button("+1") { pitch(1) },
             button("+12") { pitch(12) },
             button("Reset") { edit { it.copy(semitones = 0) } },
+            keepLengthButton,
             button("Slice to BPM") { showSliceDialog() },
             button("Trim silence") { showTrimDialog() },
         )
         root.addView(clipBar)
+        layerPanel = buildLayerPanel().apply { visibility = View.GONE }
+        root.addView(layerPanel)
 
         timeline = TimelineView(this).apply { listener = this@MainActivity }
         root.addView(timeline, LinearLayout.LayoutParams(-1, dp(190)))
         return root
+    }
+
+    private fun slider(
+        name: String, min: Float, max: Float, format: (Float) -> String, onChange: (Float) -> Unit,
+    ): Slider {
+        val steps = ((max - min) * 100).roundToInt()
+        val text = label("$name ${format(min)}").apply {
+            textSize = 11f
+            gravity = Gravity.START
+        }
+        val bar = SeekBar(this).apply {
+            this.max = steps
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onStartTrackingTouch(seekBar: SeekBar) {
+                    pushUndo()
+                }
+
+                override fun onStopTrackingTouch(seekBar: SeekBar) = refresh()
+
+                override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                    val value = min + progress / 100f
+                    text.text = "$name ${format(value)}"
+                    if (fromUser) onChange(value)
+                }
+            })
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(text)
+            addView(bar)
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        }
+        return Slider(box) { bar.progress = ((it - min) * 100).roundToInt().coerceIn(0, steps) }
+    }
+
+    private fun buildLayerPanel(): View {
+        val percent = { v: Float -> "${(v * 100).roundToInt()}%" }
+        scaleSlider = slider("Scale", 0.1f, 3f, percent) { v -> changeLayer { it.copy(scale = v) } }
+        volumeSlider = slider("Volume", 0f, 2f, percent) { v -> changeLayer { it.copy(volume = v) } }
+        xSlider = slider("X", -1.5f, 1.5f, percent) { v -> changeLayer { it.copy(x = v) } }
+        ySlider = slider("Y", -1.5f, 1.5f, percent) { v -> changeLayer { it.copy(y = v) } }
+        layerLabel = label("Layer 1 of 3")
+        flipHButton = button("Flip left/right") { toggleLayer { it.copy(flipH = !it.flipH) } }
+        flipVButton = button("Flip up/down") { toggleLayer { it.copy(flipV = !it.flipV) } }
+        val pair = { a: View, b: View ->
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(4), 0, dp(4), 0)
+                addView(a)
+                addView(b)
+            }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                row(
+                    button("Clip tools", accent = true) { showLayerPanel(false) },
+                    layerLabel,
+                    button("Number -") { renumberLayer(-1) },
+                    button("Number +") { renumberLayer(1) },
+                    flipHButton,
+                    flipVButton,
+                    button("Reset") { toggleLayer { Layer() } },
+                    button("Add layer") { addLayer() },
+                    button("Remove") { confirmRemoveLayer() },
+                ),
+            )
+            addView(pair(scaleSlider.view, volumeSlider.view))
+            addView(pair(xSlider.view, ySlider.view))
+        }
+    }
+
+    private fun showLayerPanel(show: Boolean) {
+        layerPanel.visibility = if (show) View.VISIBLE else View.GONE
+        clipBar.visibility = if (show) View.GONE else View.VISIBLE
+    }
+
+    private val layer: Layer get() = project.layers[activeLayer]
+
+    /** A live slider or drag change; the caller has already saved the undo state. */
+    private fun changeLayer(change: (Layer) -> Layer) {
+        project.layers[activeLayer] = change(layer)
+        player?.update(project.clips.toList(), layerGains())
+        updatePreviewFrame()
+    }
+
+    private fun toggleLayer(change: (Layer) -> Layer) {
+        pushUndo()
+        changeLayer(change)
+        refresh()
+    }
+
+    private fun renumberLayer(delta: Int) {
+        val to = activeLayer + delta
+        if (to !in project.layers.indices) return
+        pushUndo()
+        project.moveLayer(activeLayer, to)
+        activeLayer = to
+        refresh()
+    }
+
+    private fun addLayer() {
+        if (project.layers.size >= MAX_LAYERS) {
+            toast("The limit is $MAX_LAYERS layers")
+            return
+        }
+        pushUndo()
+        project.addLayer()
+        activeLayer = project.layers.lastIndex
+        refresh()
+    }
+
+    private fun confirmRemoveLayer() {
+        if (project.layers.size <= 1) {
+            toast("A project needs at least one layer")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setMessage("Remove layer ${activeLayer + 1} and its clips?")
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Remove") { _, _ ->
+                pushUndo()
+                project.removeLayer(activeLayer)
+                if (selected() == null) selectedId = null
+                activeLayer = activeLayer.coerceAtMost(project.layers.lastIndex)
+                refresh()
+            }
+            .show()
+    }
+
+    private fun layerGains() = FloatArray(project.layers.size) { project.layers[it].volume }
+
+    private val previewGestures = object : PreviewSurface.Listener {
+        override fun onGestureStart() = pushUndo()
+
+        override fun onMove(dx: Float, dy: Float) = changeLayer {
+            it.copy(x = (it.x + dx).coerceIn(-1.5f, 1.5f), y = (it.y + dy).coerceIn(-1.5f, 1.5f))
+        }
+
+        override fun onScale(factor: Float) = changeLayer { it.copy(scale = (it.scale * factor).coerceIn(0.1f, 3f)) }
+
+        override fun onGestureEnd() = refresh()
     }
 
     // --- State and undo ---
@@ -245,7 +403,7 @@ class MainActivity : Activity(), TimelineView.Listener {
     private fun selected(): Clip? = project.clip(selectedId)
 
     private fun pushUndo() {
-        undoStack.addLast(Snapshot(project.clips.toList(), project.bpm, selectedId))
+        undoStack.addLast(current())
         while (undoStack.size > 100) undoStack.removeFirst()
         redoStack.clear()
     }
@@ -253,12 +411,15 @@ class MainActivity : Activity(), TimelineView.Listener {
     private fun restore(s: Snapshot) {
         project.clips.clear()
         project.clips.addAll(s.clips)
+        project.layers.clear()
+        project.layers.addAll(s.layers)
+        activeLayer = activeLayer.coerceAtMost(project.layers.lastIndex)
         project.bpm = s.bpm
         selectedId = s.selected
         refresh()
     }
 
-    private fun current() = Snapshot(project.clips.toList(), project.bpm, selectedId)
+    private fun current() = Snapshot(project.clips.toList(), project.layers.toList(), project.bpm, selectedId)
 
     private fun undo() {
         val s = undoStack.removeLastOrNull() ?: return
@@ -296,6 +457,17 @@ class MainActivity : Activity(), TimelineView.Listener {
         timeline.playheadUs = playheadUs
         timeline.invalidate()
         val clip = selected()
+        timeline.activeLayer = activeLayer
+        val l = layer
+        layerLabel.text = "Layer ${activeLayer + 1} of ${project.layers.size}"
+        scaleSlider.set(l.scale)
+        volumeSlider.set(l.volume)
+        xSlider.set(l.x)
+        ySlider.set(l.y)
+        flipHButton.text = if (l.flipH) "Left/right: flipped" else "Flip left/right"
+        flipVButton.text = if (l.flipV) "Up/down: flipped" else "Flip up/down"
+        keepLengthButton.text = if (clip?.keepLength == true) "Keep length: on" else "Keep length: off"
+        player?.update(project.clips.toList(), layerGains())
         clipBar.alpha = if (clip != null) 1f else 0.35f
         pitchLabel.text = "%+d st".format(clip?.semitones ?: 0)
         invertButton.text = if (clip?.invert == true) "Invert: on" else "Invert"
@@ -318,13 +490,16 @@ class MainActivity : Activity(), TimelineView.Listener {
     }
 
     private fun updatePreviewFrame() {
-        val clip = Timeline.visibleClip(project.clips, playheadUs) { project.source(it.sourceId)?.hasVideo == true }
-        if (clip == null) {
-            previewImage.setImageBitmap(null)
-            return
+        val (width, height) = Composition.outputSize(PREVIEW_SHORT_SIDE, project.clips) { project.source(it) }
+        val stack = Timeline.stack(project.clips, playheadUs, project.layers.size) {
+            project.source(it.sourceId)?.hasVideo == true
         }
-        previewImage.colorFilter = if (clip.invert) invertFilter else null
-        project.source(clip.sourceId)?.let { previewer.show(it, clip.sourceAt(playheadUs)) }
+        val items = stack.mapNotNull { clip ->
+            val proxy = proxies[clip.sourceId] ?: return@mapNotNull null
+            val sourceUs = clip.sourceAt(playheadUs).coerceIn(clip.inUs, clip.outUs)
+            PreviewSurface.Item(proxy, proxy.slotFor(sourceUs), project.layers[clip.track], clip.invert)
+        }
+        preview.show(PreviewSurface.Scene(items, width, height))
     }
 
     // --- Timeline callbacks ---
@@ -337,8 +512,15 @@ class MainActivity : Activity(), TimelineView.Listener {
         updatePreviewFrame()
     }
 
+    override fun onLayerTapped(index: Int) {
+        activeLayer = index
+        showLayerPanel(true)
+        refresh()
+    }
+
     override fun onSelect(clip: Clip?) {
         selectedId = clip?.id
+        if (clip != null) activeLayer = clip.track.coerceIn(0, project.layers.lastIndex)
         refresh()
     }
 
@@ -394,8 +576,8 @@ class MainActivity : Activity(), TimelineView.Listener {
 
     private fun showSliceDialog() {
         val clip = requireSelection() ?: return
-        val names = arrayOf("Every bar (4 beats)", "Every 2 beats", "Every beat", "Every 1/2 beat", "Every 1/4 beat")
-        val beats = doubleArrayOf(4.0, 2.0, 1.0, 0.5, 0.25)
+        val names = Divisions.all.map { "Every ${it.second}" }.toTypedArray()
+        val beats = Divisions.all.map { it.first }
         AlertDialog.Builder(this)
             .setTitle("Slice at ${formatBpm(project.bpm)} BPM")
             .setItems(names) { _, which ->
@@ -456,19 +638,13 @@ class MainActivity : Activity(), TimelineView.Listener {
     }
 
     private fun cycleDivision() {
-        val options = listOf(4.0, 2.0, 1.0, 0.5, 0.25)
-        val i = options.indexOf(project.snapBeats)
+        val options = Divisions.all.map { it.first }
+        val i = options.indexOfFirst { kotlin.math.abs(it - project.snapBeats) < 1e-9 }
         project.snapBeats = options[(i + 1) % options.size]
         refresh()
     }
 
-    private fun divisionName(beats: Double) = when (beats) {
-        4.0 -> "1 bar"
-        2.0 -> "2 beats"
-        1.0 -> "1 beat"
-        0.5 -> "1/2 beat"
-        else -> "1/4 beat"
-    }
+    private fun divisionName(beats: Double) = Divisions.name(beats)
 
     // --- Playback ---
 
@@ -500,7 +676,7 @@ class MainActivity : Activity(), TimelineView.Listener {
             return
         }
         if (playheadUs >= Timeline.durationUs(project.clips)) playheadUs = 0
-        player = AudioPreview(playheadUs, project.clips.toList(), HashMap(readers)).also { it.start() }
+        player = AudioPreview(playheadUs, project.clips.toList(), HashMap(readers), layerGains()).also { it.start() }
         playButton.text = "Stop"
         main.post(playTick)
     }
@@ -560,14 +736,45 @@ class MainActivity : Activity(), TimelineView.Listener {
     private fun addImported(source: Source) {
         pushUndo()
         project.sources += source
-        addClip(source, Timeline.durationUs(project.clips))
+        queueProxy(source)
+        addClip(source, Timeline.durationUs(project.clips.filter { it.track == activeLayer }))
     }
 
     private fun addClip(source: Source, atUs: Long) {
-        val clip = Clip(project.allocateId(), source.id, 0, atUs, 0, source.durationUs)
+        val clip = Clip(project.allocateId(), source.id, activeLayer, atUs, 0, source.durationUs)
         project.clips += clip
         selectedId = clip.id
         refresh()
+    }
+
+    /** Builds preview frames in the background, one video at a time, showing them as they arrive. */
+    private fun queueProxy(source: Source) {
+        if (!source.hasVideo || proxies.containsKey(source.id)) return
+        val proxy = FrameProxy(this, source)
+        proxies[source.id] = proxy
+        if (proxy.complete) return
+        proxyWorker.execute {
+            val watcher = object : Runnable {
+                override fun run() {
+                    if (closing || proxy.complete) return
+                    proxyStatus.visibility = View.VISIBLE
+                    proxyStatus.text = "Preparing preview ${(proxy.progress * 100).roundToInt()}%"
+                    if (player == null) updatePreviewFrame()
+                    main.postDelayed(this, 400)
+                }
+            }
+            main.post(watcher)
+            try {
+                proxy.build(this) { closing }
+            } catch (e: Exception) {
+                main.post { toast("Preview unavailable for ${source.name}: ${e.message}") }
+            }
+            main.removeCallbacks(watcher)
+            main.post {
+                proxyStatus.visibility = View.GONE
+                if (player == null) updatePreviewFrame()
+            }
+        }
     }
 
     private fun showLibrary() {
@@ -616,7 +823,11 @@ class MainActivity : Activity(), TimelineView.Listener {
             .setPositiveButton("New project") { _, _ ->
                 stopPlayback()
                 project.sources.forEach { MediaLibrary.deleteCached(this, it) }
+                proxies.values.forEach { it.close() }
+                proxies.clear()
+                preview.clearCache()
                 project = Project()
+                activeLayer = 0
                 timeline.project = project
                 readers.clear()
                 envelopes.clear()
@@ -673,6 +884,7 @@ class MainActivity : Activity(), TimelineView.Listener {
             .show()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val clips = project.clips.toList()
+        val layers = project.layers.toList()
         val sources = project.sources.associateBy { it.id }
         val pcm = HashMap(readers)
         val temp = File(cacheDir, "export.mp4")
@@ -680,7 +892,7 @@ class MainActivity : Activity(), TimelineView.Listener {
             val message = try {
                 temp.delete()
                 VideoExporter(
-                    this, clips, sources, pcm, settings,
+                    this, clips, layers, sources, pcm, settings,
                     { p -> main.post { bar.progress = (p * 1000).roundToInt() } },
                     { exportCancelled },
                 ).export(temp)
@@ -735,12 +947,15 @@ class MainActivity : Activity(), TimelineView.Listener {
     override fun onDestroy() {
         super.onDestroy()
         main.removeCallbacksAndMessages(null)
-        previewer.release()
+        closing = true
+        preview.release()
         background.shutdown()
+        proxyWorker.shutdown()
     }
 
     private companion object {
         const val REQUEST_IMPORT = 1
         const val REQUEST_EXPORT = 2
+        const val PREVIEW_SHORT_SIDE = 720
     }
 }

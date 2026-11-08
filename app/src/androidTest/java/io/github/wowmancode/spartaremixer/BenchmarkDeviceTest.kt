@@ -1,13 +1,15 @@
 package io.github.wowmancode.spartaremixer
 
-import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import android.graphics.BitmapFactory
 import io.github.wowmancode.spartaremixer.core.Clip
+import io.github.wowmancode.spartaremixer.core.Layer
 import io.github.wowmancode.spartaremixer.media.ExportSettings
+import io.github.wowmancode.spartaremixer.media.FrameProxy
 import io.github.wowmancode.spartaremixer.media.MediaLibrary
 import io.github.wowmancode.spartaremixer.media.VideoExporter
 import org.junit.Test
@@ -34,20 +36,20 @@ class BenchmarkDeviceTest {
         val output = File(context.cacheDir, "bench_out.mp4").apply { delete() }
         val exportStart = SystemClock.elapsedRealtime()
         VideoExporter(
-            context, clips, mapOf(source.id to source), mapOf(source.id to reader),
+            context, clips, List(3) { Layer() }, mapOf(source.id to source), mapOf(source.id to reader),
             ExportSettings(shortSide = 720), {}, { false },
         ).export(output)
         Log.i("SpartaBench", "export_ms=${SystemClock.elapsedRealtime() - exportStart}")
 
-        val retriever = MediaMetadataRetriever()
-        retriever.setDataSource(context, Uri.fromFile(file))
+        val proxy = FrameProxy(context, source)
+        val buildStart = SystemClock.elapsedRealtime()
+        proxy.build(context) { false }
+        Log.i("SpartaBench", "proxy_build_ms=${SystemClock.elapsedRealtime() - buildStart} for_8s_video")
         val previewStart = SystemClock.elapsedRealtime()
         for (i in 0 until 48) {
-            retriever.getScaledFrameAtTime(
-                chopPoints[i % chopPoints.size] + i * 3_000L, MediaMetadataRetriever.OPTION_CLOSEST, 640, 360,
-            )
+            val bytes = proxy.read(proxy.resolve(proxy.slotFor(chopPoints[i % chopPoints.size] + i * 3_000L)))!!
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         }
         Log.i("SpartaBench", "preview_frame_ms=${(SystemClock.elapsedRealtime() - previewStart) / 48}")
-        retriever.release()
     }
 }

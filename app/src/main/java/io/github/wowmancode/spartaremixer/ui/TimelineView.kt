@@ -14,7 +14,6 @@ import io.github.wowmancode.spartaremixer.core.Clip
 import io.github.wowmancode.spartaremixer.core.ENVELOPE_WINDOW_US
 import io.github.wowmancode.spartaremixer.core.MIN_CLIP_US
 import io.github.wowmancode.spartaremixer.core.Project
-import io.github.wowmancode.spartaremixer.core.TRACK_COUNT
 import io.github.wowmancode.spartaremixer.core.Timeline
 import kotlin.math.abs
 import kotlin.math.floor
@@ -28,12 +27,18 @@ class TimelineView(context: Context) : View(context) {
         fun onSelect(clip: Clip?)
         fun onEditStart()
         fun onClipEdited()
+        fun onLayerTapped(index: Int)
     }
 
     var project = Project()
     var listener: Listener? = null
     var envelopes: Map<String, FloatArray> = emptyMap()
     var playheadUs = 0L
+        set(value) {
+            field = value
+            invalidate()
+        }
+    var activeLayer = 0
         set(value) {
             field = value
             invalidate()
@@ -48,6 +53,9 @@ class TimelineView(context: Context) : View(context) {
     private val rulerHeight = 30 * density
     private var pxPerSecond = 120f * density
     private var scrollPx = 0f
+    private var scrollRowsPx = 0f
+    private val gutter = 30 * density
+    private val minRow = 36 * density
 
     private val background = fill(Color.rgb(18, 13, 13))
     private val rulerPaint = fill(Color.rgb(36, 24, 24))
@@ -65,6 +73,13 @@ class TimelineView(context: Context) : View(context) {
         textSize = 11 * density
     }
     private val rect = RectF()
+    private val gutterPaint = fill(Color.rgb(46, 30, 30))
+    private val activeGutterPaint = fill(Color.rgb(242, 193, 78))
+    private val subdivisionPaint = line(Color.argb(30, 255, 255, 255), 1f)
+    private val gutterText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textSize = 13 * density
+        textAlign = Paint.Align.CENTER
+    }
 
     private enum class Mode { NONE, SEEK, PAN, MOVE, TRIM_LEFT, TRIM_RIGHT }
 
@@ -72,6 +87,7 @@ class TimelineView(context: Context) : View(context) {
     private var downX = 0f
     private var downY = 0f
     private var downScroll = 0f
+    private var downRows = 0f
     private var dragging = false
     private var touchedClip: Clip? = null
     private var scaling = false
@@ -89,7 +105,7 @@ class TimelineView(context: Context) : View(context) {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
                 val focusUs = xToTime(detector.focusX)
                 pxPerSecond = (pxPerSecond * detector.scaleFactor).coerceIn(12f * density, 1600f * density)
-                scrollPx = max(0f, focusUs / 1e6f * pxPerSecond - detector.focusX)
+                scrollPx = max(0f, focusUs / 1e6f * pxPerSecond - (detector.focusX - gutter))
                 invalidate()
                 return true
             }
@@ -107,36 +123,73 @@ class TimelineView(context: Context) : View(context) {
         strokeWidth = width * resources.displayMetrics.density
     }
 
-    private fun timeToX(us: Long): Float = us / 1e6f * pxPerSecond - scrollPx
-    private fun xToTime(x: Float): Long = max(0L, ((x + scrollPx) / pxPerSecond * 1e6).roundToLong())
-    private val trackHeight: Float get() = (height - rulerHeight) / TRACK_COUNT
-    private fun trackTop(track: Int): Float = rulerHeight + track * trackHeight
+    private fun timeToX(us: Long): Float = us / 1e6f * pxPerSecond - scrollPx + gutter
+    private fun xToTime(x: Float): Long = max(0L, ((x - gutter + scrollPx) / pxPerSecond * 1e6).roundToLong())
+    private val layerCount: Int get() = project.layers.size
+    private val trackHeight: Float get() = max(minRow, (height - rulerHeight) / layerCount)
+    private val maxRowScroll: Float get() = max(0f, layerCount * trackHeight - (height - rulerHeight))
+    private fun trackTop(track: Int): Float = rulerHeight + track * trackHeight - scrollRowsPx.coerceAtMost(maxRowScroll)
+    private fun trackAt(y: Float): Int = ((y - trackTop(0)) / trackHeight).toInt()
 
     /** Keeps the playhead on screen while the project plays. */
     fun follow() {
         val x = timeToX(playheadUs)
-        if (x > width * 0.85f || x < 0) scrollPx = max(0f, playheadUs / 1e6f * pxPerSecond - width * 0.2f)
+        if (x > width * 0.85f || x < gutter) scrollPx = max(0f, playheadUs / 1e6f * pxPerSecond - width * 0.2f)
     }
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), background)
-        for (t in 0 until TRACK_COUNT) {
+        canvas.drawRect(0f, 0f, width.toFloat(), rulerHeight, rulerPaint)
+        canvas.save()
+        canvas.clipRect(0f, rulerHeight, width.toFloat(), height.toFloat())
+        for (t in 0 until layerCount) {
             val top = trackTop(t)
             canvas.drawRect(0f, top + density, width.toFloat(), top + trackHeight - density, trackPaint)
         }
-        canvas.drawRect(0f, 0f, width.toFloat(), rulerHeight, rulerPaint)
+        canvas.restore()
         drawGrid(canvas)
+        canvas.save()
+        canvas.clipRect(gutter, rulerHeight, width.toFloat(), height.toFloat())
         project.clips.filter { it.id != selectedId }.forEach { drawClip(canvas, it) }
         project.clip(selectedId)?.let { drawClip(canvas, it) }
+        canvas.restore()
+        drawGutter(canvas)
         val px = timeToX(playheadUs)
         canvas.drawLine(px, 0f, px, height.toFloat(), playheadPaint)
     }
 
+    private fun drawGutter(canvas: Canvas) {
+        canvas.save()
+        canvas.clipRect(0f, rulerHeight, gutter, height.toFloat())
+        for (t in 0 until layerCount) {
+            val top = trackTop(t)
+            val active = t == activeLayer
+            canvas.drawRect(0f, top + density, gutter, top + trackHeight - density, if (active) activeGutterPaint else gutterPaint)
+            gutterText.color = if (active) Color.rgb(24, 12, 12) else Color.WHITE
+            canvas.drawText("${t + 1}", gutter / 2, top + trackHeight / 2 + 5 * density, gutterText)
+        }
+        canvas.restore()
+    }
+
+    private fun drawSubdivisions(canvas: Canvas) {
+        if (!project.snapEnabled || project.snapBeats >= 1.0) return
+        val step = Timeline.beatUs(project.bpm) * project.snapBeats
+        if (step / 1e6 * pxPerSecond < 9 * density) return
+        var i = floor(xToTime(gutter) / step).toLong()
+        val last = (xToTime(width.toFloat()) / step).toLong() + 1
+        while (i <= last) {
+            val x = timeToX((i * step).roundToLong())
+            canvas.drawLine(x, rulerHeight, x, height.toFloat(), subdivisionPaint)
+            i++
+        }
+    }
+
     private fun drawGrid(canvas: Canvas) {
+        drawSubdivisions(canvas)
         val beat = Timeline.beatUs(project.bpm)
         val beatPx = beat / 1e6 * pxPerSecond
         val barsOnly = beatPx < 8 * density
-        val first = max(0L, floor(xToTime(0f) / beat).toLong())
+        val first = max(0L, floor(xToTime(gutter) / beat).toLong())
         val last = (xToTime(width.toFloat()) / beat).toLong() + 1
         var b = first
         while (b <= last) {
@@ -153,7 +206,7 @@ class TimelineView(context: Context) : View(context) {
     private fun drawClip(canvas: Canvas, clip: Clip) {
         val left = timeToX(clip.startUs)
         val right = timeToX(clip.endUs)
-        if (right < 0 || left > width) return
+        if (right < gutter || left > width) return
         val top = trackTop(clip.track) + 2 * density
         val bottom = top + trackHeight - 4 * density
         rect.set(left, top, right, bottom)
@@ -163,7 +216,7 @@ class TimelineView(context: Context) : View(context) {
         canvas.save()
         canvas.clipRect(rect)
         val label = (project.source(clip.sourceId)?.name ?: "missing") +
-            if (clip.semitones != 0) "  ${"%+d".format(clip.semitones)} st" else ""
+            if (clip.semitones != 0) "  ${"%+d".format(clip.semitones)} st${if (clip.keepLength) " fixed" else ""}" else ""
         canvas.drawText(label, left + 5 * density, top + 13 * density, textPaint)
         canvas.restore()
         if (clip.id == selectedId) {
@@ -180,7 +233,7 @@ class TimelineView(context: Context) : View(context) {
         val maxHalf = (bottom - top) / 2 - 8 * density
         if (maxHalf <= 0) return
         val step = 2 * density
-        var x = max(left, 0f)
+        var x = max(left, gutter)
         val end = min(right, width.toFloat())
         while (x < end) {
             val sourceUs = clip.sourceAt(((x - left) / pxPerSecond * 1e6).roundToLong() + clip.startUs)
@@ -195,7 +248,7 @@ class TimelineView(context: Context) : View(context) {
 
     private fun clipAt(x: Float, y: Float): Clip? {
         if (y < rulerHeight) return null
-        val track = ((y - rulerHeight) / trackHeight).toInt()
+        val track = trackAt(y)
         val time = xToTime(x)
         return project.clips.filter { it.track == track && time in it.startUs..it.endUs }
             .sortedByDescending { it.id == selectedId }
@@ -230,12 +283,19 @@ class TimelineView(context: Context) : View(context) {
         downX = event.x
         downY = event.y
         downScroll = scrollPx
+        downRows = scrollRowsPx.coerceAtMost(maxRowScroll)
         dragging = false
         scaling = false
         touchedClip = null
         if (event.y < rulerHeight) {
             mode = Mode.SEEK
             listener?.onSeek(xToTime(event.x))
+            return
+        }
+        if (event.x < gutter) {
+            mode = Mode.NONE
+            val track = trackAt(event.y)
+            if (track in 0 until layerCount) listener?.onLayerTapped(track)
             return
         }
         val clip = clipAt(event.x, event.y)
@@ -263,6 +323,7 @@ class TimelineView(context: Context) : View(context) {
             Mode.SEEK -> listener?.onSeek(xToTime(event.x))
             Mode.PAN -> {
                 scrollPx = max(0f, downScroll - dx)
+                scrollRowsPx = (downRows - dy).coerceIn(0f, maxRowScroll)
                 invalidate()
             }
             Mode.MOVE, Mode.TRIM_LEFT, Mode.TRIM_RIGHT -> if (clip != null) {
@@ -288,7 +349,7 @@ class TimelineView(context: Context) : View(context) {
     }
 
     private fun moved(clip: Clip, deltaUs: Long, y: Float): Clip {
-        val track = ((y - rulerHeight) / trackHeight).toInt().coerceIn(0, TRACK_COUNT - 1)
+        val track = trackAt(y).coerceIn(0, layerCount - 1)
         return clip.copy(startUs = project.snapped(clip.startUs + deltaUs), track = track)
     }
 
@@ -310,7 +371,7 @@ class TimelineView(context: Context) : View(context) {
 
     private fun onUp(event: MotionEvent) {
         if (dragging) return
-        if (mode == Mode.SEEK) return
+        if (mode == Mode.SEEK || event.x < gutter) return
         val clip = touchedClip
         selectedId = clip?.id
         listener?.onSelect(clip)

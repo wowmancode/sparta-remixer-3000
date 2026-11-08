@@ -3,9 +3,10 @@
 A free and open source Android video editor for Sparta remixes.
 
 - **Import** videos and audio from anywhere on your device
-- **Free timeline** with three tracks, drag to move, handles to trim, pinch to zoom
+- **Layers**: up to six videos on screen at once, each with its own scale, position, number, volume and flips
+- **Free timeline**: drag to move, handles to trim, pinch to zoom
 - **BPM** typed in or tapped, with a beat grid and optional snapping
-- **Pitch** per clip in semitones, sampler style (audio and video speed change together)
+- **Pitch** per clip in semitones, sampler style or with the length kept fixed
 - **Invert** video colors per clip
 - **Auto cut**: slice a clip on the BPM grid, or trim silence
 - **Export** H.264/AAC MP4 at 480p, 720p or 1080p through Android `MediaCodec`
